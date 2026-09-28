@@ -1,0 +1,59 @@
+# A crash-safe worker loop, entirely offline and deterministic (run this
+# TWICE - `ecko example.ecko` - and the output is byte-identical both times).
+#
+# We fix `now` ourselves throughout instead of reading the wall clock, and we
+# never print a lease token (it is random) - that's what keeps the two runs
+# identical, which is the same requirement any caller's own tests should
+# follow when using this package.
+import std.sql
+import "./main.ecko"
+queue = main
+
+db = sql.open(":memory:")
+queue.init(db)
+
+T0 = 1700000000000
+
+# Three jobs: one that will succeed, one that will fail twice then succeed,
+# and one that will fail until it is dead-lettered (max_attempts: 1).
+queue.enqueue(db, "emails", { to: "ada@example.com" }, { now: T0 })
+queue.enqueue(db, "emails", { to: "grace@example.com" }, { now: T0 })
+queue.enqueue(db, "emails", { to: "bad-address" }, { now: T0, max_attempts: 1 })
+
+# A tiny delivery step that fails for the second job on its first attempt,
+# and always fails for the deliberately-bad address.
+fn deliver(job) {
+    to = job.payload.to
+    if to == "bad-address" { error("no such mailbox") }
+    if to == "grace@example.com" and job.attempts == 1 { error("smtp timeout") }
+    print("sent to {to}")
+}
+
+# A worker pass: claim everything ready and process it. `now` is fixed for
+# the whole run so leases and backoff are reproducible.
+fn run_worker(now) {
+    mut job = queue.claim(db, "emails", "worker-1", 30000, { now: now })
+    while job != null {
+        try {
+            deliver(job)
+            queue.complete(db, job, { now: now })
+        } catch (e) {
+            result = queue.fail(db, job, string(e), { now: now })
+            print("failed ({string(e)}), now {result.status}")
+        }
+        job = queue.claim(db, "emails", "worker-1", 30000, { now: now })
+    }
+}
+
+print("-- first pass --")
+run_worker(T0)
+
+print("-- second pass, one minute later (backoff has elapsed) --")
+run_worker(T0 + 60000)
+
+s = queue.stats(db, "emails", { now: T0 + 60000 })
+print("done: {s.done}, dead: {s.dead}, total: {s.total}")
+
+for d in queue.dead(db, "emails") {
+    print("dead-lettered: {d.payload.to} ({d.last_error}, {d.attempts} attempt(s))")
+}

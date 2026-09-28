@@ -1,0 +1,261 @@
+# Behavioural tests for the queue package - run offline via `ecko test`.
+# Every test uses a fresh in-memory db and an explicit `now`, so nothing here
+# touches the wall clock and every run is byte-identical.
+import std.fs
+import std.sql
+import std.test
+import "../main.ecko"
+queue = main
+
+fn fresh_db() {
+    db = sql.open(":memory:")
+    queue.init(db)
+    db
+}
+
+T0 = 1700000000000
+
+test.case("enqueue then claim returns the job; payload round-trips", fn() {
+    db = fresh_db()
+    id = queue.enqueue(db, "emails", { to: "a@example.com" }, { now: T0 })
+    job = queue.claim(db, "emails", "w1", 30000, { now: T0 })
+    test.eq(job.id, id)
+    test.eq(job.queue_name, "emails")
+    test.eq(job.payload, { to: "a@example.com" })
+    test.eq(job.attempts, 1)
+    test.eq(job.max_attempts, 5)
+    test.eq(job.worker_id, "w1")
+    test.eq(job.lease_expires, T0 + 30000)
+    test.ok(job.lease_token != null, "claim assigns a lease token")
+})
+
+test.case("claim returns null when the queue is empty", fn() {
+    db = fresh_db()
+    test.eq(queue.claim(db, "emails", "w1", 30000, { now: T0 }), null)
+})
+
+test.case("claim returns null once a job is already leased; another queue is unaffected", fn() {
+    db = fresh_db()
+    queue.enqueue(db, "emails", "only job", { now: T0 })
+    job = queue.claim(db, "emails", "w1", 30000, { now: T0 })
+    test.ok(job != null, "first claim succeeds")
+    # same instant, lease still active: nothing left to claim for this worker
+    test.eq(queue.claim(db, "emails", "w2", 30000, { now: T0 }), null)
+    # a different queue was never touched
+    test.eq(queue.claim(db, "reports", "w2", 30000, { now: T0 }), null)
+})
+
+test.case("two available jobs claim to two different workers, never the same job", fn() {
+    db = fresh_db()
+    id_a = queue.enqueue(db, "emails", "a", { now: T0 })
+    id_b = queue.enqueue(db, "emails", "b", { now: T0 + 1 })
+    job1 = queue.claim(db, "emails", "w1", 30000, { now: T0 + 5 })
+    job2 = queue.claim(db, "emails", "w2", 30000, { now: T0 + 5 })
+    test.ok(job1 != null and job2 != null, "both claims succeed")
+    test.ok(job1.id != job2.id, "the two workers never claim the same job")
+    test.eq(sort([job1.id, job2.id]), sort([id_a, id_b]))
+    # oldest (earliest run_at) goes first
+    test.eq(job1.id, id_a)
+})
+
+test.case("complete marks the job done and stats reflects it", fn() {
+    db = fresh_db()
+    queue.enqueue(db, "emails", "hi", { now: T0 })
+    job = queue.claim(db, "emails", "w1", 30000, { now: T0 })
+    test.eq(queue.complete(db, job, { now: T0 + 1 }), null)
+    s = queue.stats(db, "emails", { now: T0 + 1 })
+    test.eq(s.done, 1)
+    test.eq(s.in_progress, 0)
+    test.eq(s.total, 1)
+})
+
+test.case("a stale worker's complete is refused once the lease expires and is reclaimed", fn() {
+    db = fresh_db()
+    queue.enqueue(db, "emails", "hi", { now: T0 })
+    stale = queue.claim(db, "emails", "dead-worker", 1000, { now: T0 })  # 1s lease
+    # the lease is now expired (T0 + 1000 has passed); a second worker reclaims it
+    fresh = queue.claim(db, "emails", "fresh-worker", 30000, { now: T0 + 2000 })
+    test.ok(fresh != null, "the expired job is reclaimable")
+    test.eq(fresh.id, stale.id)
+    test.ok(fresh.lease_token != stale.lease_token, "reclaiming issues a new lease token")
+
+    caught = null
+    try { queue.complete(db, stale, { now: T0 + 2500 }) } catch (e) { caught = e }
+    test.ok(caught != null, "the stale worker's complete raises")
+    test.eq(get(caught, "kind"), "queue")
+    test.eq(get(caught, "reason"), "lease_lost")
+
+    # the fresh worker still holds it and can complete it normally
+    test.eq(queue.complete(db, fresh, { now: T0 + 2600 }), null)
+    test.eq(queue.stats(db, "emails", { now: T0 + 2600 }).done, 1)
+})
+
+test.case("extend refreshes the lease; a stale extend is refused the same way", fn() {
+    db = fresh_db()
+    queue.enqueue(db, "emails", "hi", { now: T0 })
+    job = queue.claim(db, "emails", "w1", 1000, { now: T0 })
+    extended = queue.extend(db, job, 60000, { now: T0 + 500 })
+    test.eq(extended.lease_expires, T0 + 500 + 60000)
+    test.eq(extended.lease_token, job.lease_token)
+    # nobody else has claimed it, so completing under the original job value
+    # (same lease_token) still works even though its own lease_expires field
+    # is stale - `own_or_die` checks the token, not the clock.
+    test.eq(queue.complete(db, job, { now: T0 + 600 }), null)
+
+    caught = null
+    try { queue.extend(db, job, 1000, { now: T0 + 700 }) } catch (e) { caught = e }
+    test.eq(get(caught, "reason"), "lease_lost")
+})
+
+test.case("fail retries with backoff until max_attempts, then dead-letters", fn() {
+    db = fresh_db()
+    queue.enqueue(db, "emails", "flaky", { now: T0, max_attempts: 3 })
+
+    job1 = queue.claim(db, "emails", "w1", 30000, { now: T0 })
+    r1 = queue.fail(db, job1, "boom 1", { now: T0 + 10, backoff_ms: 1000 })
+    test.eq(r1, { status: "ready", attempts: 1, run_at: T0 + 10 + 1000 })
+    test.eq(queue.stats(db, "emails", { now: T0 + 10 }).ready, 0)  # not due yet
+    test.eq(queue.stats(db, "emails", { now: T0 + 10 }).scheduled, 1)
+
+    job2 = queue.claim(db, "emails", "w1", 30000, { now: T0 + 2000 })
+    test.ok(job2 != null, "job is claimable again after its backoff elapses")
+    test.eq(job2.attempts, 2)
+    r2 = queue.fail(db, job2, "boom 2", { now: T0 + 2010, backoff_ms: 1000 })
+    test.eq(r2.status, "ready")
+    test.eq(r2.run_at, T0 + 2010 + 2000)  # second failure: backoff doubled
+
+    job3 = queue.claim(db, "emails", "w1", 30000, { now: T0 + 5000 })
+    test.eq(job3.attempts, 3)
+    r3 = queue.fail(db, job3, "boom 3", { now: T0 + 5010 })
+    # dead-lettering does not touch run_at; it stays at r2's retry time
+    test.eq(r3, { status: "dead", attempts: 3, run_at: T0 + 2010 + 2000 })
+
+    dead_jobs = queue.dead(db, "emails")
+    test.eq(len(dead_jobs), 1)
+    test.eq(dead_jobs[0].id, job3.id)
+    test.eq(dead_jobs[0].payload, "flaky")
+    test.eq(dead_jobs[0].attempts, 3)
+    test.eq(dead_jobs[0].last_error, "boom 3")
+
+    s = queue.stats(db, "emails", { now: T0 + 5010 })
+    test.eq(s.dead, 1)
+    test.eq(s.ready, 0)
+    test.eq(s.total, 1)
+})
+
+test.case("delayed jobs are not claimable before run_at", fn() {
+    db = fresh_db()
+    queue.enqueue(db, "emails", "later", { now: T0, delay_ms: 60000 })
+    test.eq(queue.claim(db, "emails", "w1", 30000, { now: T0 + 100 }), null)
+    test.eq(queue.claim(db, "emails", "w1", 30000, { now: T0 + 59999 }), null)
+    job = queue.claim(db, "emails", "w1", 30000, { now: T0 + 60000 })
+    test.ok(job != null, "claimable once run_at is reached")
+})
+
+test.case("an explicit run_at wins over delay_ms", fn() {
+    db = fresh_db()
+    queue.enqueue(db, "emails", "x", { now: T0, delay_ms: 60000, run_at: T0 + 5 })
+    test.eq(queue.claim(db, "emails", "w1", 30000, { now: T0 }), null)
+    job = queue.claim(db, "emails", "w1", 30000, { now: T0 + 5 })
+    test.ok(job != null, "claimable at the explicit run_at, ignoring delay_ms")
+})
+
+test.case("stats counts ready, scheduled, in_progress, expired, done and dead", fn() {
+    db = fresh_db()
+    # Each job below is claimed (or completed/failed) immediately after it is
+    # the only ready one - `claim` always takes the oldest ready job, so an
+    # earlier job left ready would be picked up instead of the one intended.
+    queue.enqueue(db, "q", "will-stay-active", { now: T0 })
+    active = queue.claim(db, "q", "w1", 30000, { now: T0 })
+
+    queue.enqueue(db, "q", "will-expire", { now: T0 })
+    expiring = queue.claim(db, "q", "w2", 1000, { now: T0 })
+
+    queue.enqueue(db, "q", "will-complete", { now: T0 })
+    to_complete = queue.claim(db, "q", "w3", 30000, { now: T0 })
+    queue.complete(db, to_complete, { now: T0 })
+
+    queue.enqueue(db, "q", "will-die", { now: T0, max_attempts: 1 })
+    to_die = queue.claim(db, "q", "w4", 30000, { now: T0 })
+    queue.fail(db, to_die, "fatal", { now: T0 })
+
+    # Left ready on purpose: nothing above ever leaves a job ready, so these
+    # are the only ones stats can count under `ready`/`scheduled`.
+    queue.enqueue(db, "q", "later", { now: T0, delay_ms: 60000 })
+    queue.enqueue(db, "q", "ready-now", { now: T0 })
+
+    s = queue.stats(db, "q", { now: T0 + 2000 })  # past the 1s lease on `expiring`
+    test.eq(s.ready, 1)  # ready-now, unclaimed
+    test.eq(s.scheduled, 1)  # later, delayed
+    test.eq(s.in_progress, 1)  # active, lease not expired
+    test.eq(s.expired, 1)  # expiring, lease elapsed
+    test.eq(s.done, 1)
+    test.eq(s.dead, 1)
+    test.eq(s.total, 6)
+    test.ok(active != null and expiring != null, "sanity: both claims succeeded")
+})
+
+test.case("stats on a queue that has never been used is all zero, not null", fn() {
+    db = fresh_db()
+    s = queue.stats(db, "ghost", { now: T0 })
+    test.eq(s, { ready: 0, scheduled: 0, in_progress: 0, expired: 0, done: 0, dead: 0, total: 0 })
+})
+
+test.case("dead respects opts.limit and orders newest first", fn() {
+    db = fresh_db()
+    for i in 0..5 {
+        queue.enqueue(db, "q", i, { now: T0, max_attempts: 1 })
+    }
+    # all five share run_at = T0, so they claim in id order: 0, 1, 2, 3, 4
+    for i in 0..5 {
+        job = queue.claim(db, "q", "w", 1000, { now: T0 + i })
+        queue.fail(db, job, "err {i}", { now: T0 + i })
+    }
+    all_dead = queue.dead(db, "q")
+    test.eq(len(all_dead), 5)
+    test.eq(all_dead[0].payload, 4)  # most recently dead-lettered first
+    limited = queue.dead(db, "q", { limit: 2 })
+    test.eq(len(limited), 2)
+    test.eq(map(limited, fn(j) j.payload), [4, 3])
+})
+
+test.case("complete on an unknown job id raises not_found", fn() {
+    db = fresh_db()
+    caught = null
+    try {
+        queue.complete(db, { id: 999, lease_token: "nope" }, { now: T0 })
+    } catch (e) {
+        caught = e
+    }
+    test.ok(caught != null, "raises")
+    test.eq(get(caught, "kind"), "queue")
+    test.eq(get(caught, "reason"), "not_found")
+})
+
+# Separate connections to one file, claiming in parallel: every job is claimed
+# exactly once, and contention for SQLite's write lock never reaches the caller
+# as an error.
+test.case("parallel workers on separate connections never double-claim", fn() {
+    path = "tests/.parallel_claim_test.db"
+    if fs.exists(path) { fs.remove(path) }
+    setup = sql.open(path)
+    queue.init(setup)
+    for i in 0..100 {
+        queue.enqueue(setup, "jobs", { n: i }, { now: T0 })
+    }
+    sql.close(setup)
+    results = pmap(["w1", "w2", "w3", "w4"], fn(name) {
+        db = sql.open(path)
+        mut ids = []
+        for i in 0..200 {
+            job = queue.claim(db, "jobs", name, 60000, { now: T0 })
+            if job != null { ids = push(ids, job.id) }
+        }
+        sql.close(db)
+        ids
+    })
+    fs.remove(path)
+    all = flatten(results)
+    test.eq(len(all), 100)
+    test.eq(len(unique(all)), 100)
+})
