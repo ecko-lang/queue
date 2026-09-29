@@ -79,7 +79,7 @@ test.case("a stale worker's complete is refused once the lease expires and is re
     test.eq(fresh.id, stale.id)
     test.ok(fresh.lease_token != stale.lease_token, "reclaiming issues a new lease token")
 
-    caught = null
+    mut caught = null
     try { queue.complete(db, stale, { now: T0 + 2500 }) } catch (e) { caught = e }
     test.ok(caught != null, "the stale worker's complete raises")
     test.eq(get(caught, "kind"), "queue")
@@ -102,7 +102,7 @@ test.case("extend refreshes the lease; a stale extend is refused the same way", 
     # is stale - `own_or_die` checks the token, not the clock.
     test.eq(queue.complete(db, job, { now: T0 + 600 }), null)
 
-    caught = null
+    mut caught = null
     try { queue.extend(db, job, 1000, { now: T0 + 700 }) } catch (e) { caught = e }
     test.eq(get(caught, "reason"), "lease_lost")
 })
@@ -221,7 +221,7 @@ test.case("dead respects opts.limit and orders newest first", fn() {
 
 test.case("complete on an unknown job id raises not_found", fn() {
     db = fresh_db()
-    caught = null
+    mut caught = null
     try {
         queue.complete(db, { id: 999, lease_token: "nope" }, { now: T0 })
     } catch (e) {
