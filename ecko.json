@@ -1,6 +1,6 @@
 {
   "module": "github.com/ecko-lang/queue",
-  "version": "0.5.0",
+  "version": "0.55.0",
   "entrypoint": "main.ecko",
   "description": "Durable job queue with leases over std.sql: enqueue work, workers claim it with a lease, a worker that dies has its job reclaimed once the lease expires.",
   "author": "Sean Nieuwoudt <sean@underwulf.com>",
