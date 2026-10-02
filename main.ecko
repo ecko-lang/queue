@@ -209,6 +209,13 @@ export fn claim(db, queue_name, worker_id, lease_ms, opts = empty_map()) {
 # Another connection holding the write lock makes SQLite refuse at once with
 # "database is locked". That is contention, not failure, so wait briefly and
 # try again; anything else, or a lock that outlasts the retries, is thrown.
+# A short, growing pause: 2 ms times the attempt. `sleep` took seconds before
+# Ecko 0.58 and takes whole milliseconds from 0.58 on, and the type of
+# `time.monotonic()` says which this is, so the wait is the same on both.
+fn backoff(attempt) {
+    if type_of(time.monotonic()) == "int" { 2 * attempt } else { 0.002 * attempt }
+}
+
 fn with_lock_retry(action) {
     mut attempt = 0
     loop {
@@ -217,7 +224,7 @@ fn with_lock_retry(action) {
             locked = get(e, "kind") == "sql" and msg != null and contains(msg, "database is locked")
             if not locked or attempt >= 50 { error(e) }
             attempt = attempt + 1
-            sleep(0.002 * attempt)
+            sleep(backoff(attempt))
         }
     }
 }

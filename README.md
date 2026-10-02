@@ -146,6 +146,10 @@ yourself (`sql.exec(db, "delete from ecko_queue_jobs where status = 'done' and u
 keeps it from growing without bound; this package does not do that for you,
 since "how long to keep history" is a decision only the caller can make.
 
+**Works across Ecko 0.58**, which changed `sleep` from seconds to milliseconds.
+The short pause before retrying a locked database is 2 ms per attempt on either
+side of that change; 0.55.0 passed a fraction to `sleep`, which 0.58 refuses.
+
 ## Testing
 
 ```bash
