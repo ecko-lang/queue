@@ -36,7 +36,7 @@ queue.enqueue(db, "reports", { id: 9 }, { delay_ms: 60000, max_attempts: 3 })
 job = queue.claim(db, "emails", "worker-1", 30000)   # 30 second lease
 if job != null {
     try {
-        send(job.payload)
+        send_email(job.payload)
         queue.complete(db, job)
     } catch (e) {
         queue.fail(db, job, string(e))
