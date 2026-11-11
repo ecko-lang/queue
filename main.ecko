@@ -28,24 +28,100 @@
 # its own (`sql.exec`/`query`/`transaction` are ungated; only opening a
 # file-backed database is).
 #
-# Every function that measures time takes an `opts.now` (unix ms) so callers
-# can test without touching the wall clock; it defaults to `time.now()`.
+# Every function that reads the clock takes a `now:` named argument (unix ms)
+# so callers can test without touching the wall clock; it defaults to
+# `time.now()`.
 import std.sql
 import std.json
 import std.time
 import std.uuid
+import std.fmt
 
 # ---- internal helpers ------------------------------------------------------
 
-fn now_of(opts) {
-    n = get(opts, "now")
-    if n == null { time.now() } else { n }
+fn bad_arg(message) = error({ kind: "bug", reason: "bad_argument", message: message })
+
+# An options map passed where named arguments now go: say how to write it.
+fn no_opts_map(func, v, example) {
+    if is_map(v) {
+        bad_arg(
+            "queue.{func}: options are named arguments now: write {example}, not an options map",
+        )
+    }
+    null
 }
 
-# The value an absent numeric option falls back to.
-fn default_to(opts, key, fallback) {
-    v = get(opts, key)
-    if v == null { fallback } else { v }
+fn check_int(func, name, v, least) {
+    unless type_of(v) == "int" and v >= least {
+        what = if least > 0 { "a positive Int" } else { "a non-negative Int" }
+        bad_arg("queue.{func}: {name} must be {what}, got {fmt.inspect(v)}")
+    }
+    null
+}
+
+fn check_text(func, name, v) {
+    unless type_of(v) == "string" and v != "" {
+        bad_arg("queue.{func}: {name} must be a non-empty string, got {fmt.inspect(v)}")
+    }
+    null
+}
+
+fn check_job(func, job) {
+    unless is_map(job) and get(job, "id") != null and get(job, "lease_token") != null {
+        bad_arg("queue.{func}: job must be the map claim returned, got {fmt.inspect(job)}")
+    }
+    null
+}
+
+# `now` as given, or the wall clock.
+fn clock(func, now) {
+    unless now == null or type_of(now) == "int" {
+        bad_arg("queue.{func}: now must be an Int of Unix milliseconds, got {fmt.inspect(now)}")
+    }
+    if now == null { time.now() } else { now }
+}
+
+# Describes the first part of `v` that a JSON round trip would not give back
+# unchanged ("a decimal at `.amount`"), or returns null when all of it would.
+# Decimals, records, secrets, bytes and functions all encode to something that
+# decodes as a different value; refusing them is better than handing back a
+# silently different one later.
+fn unstorable(v, path = "") {
+    t = type_of(v)
+    here = if path == "" { "" } else { " at `{path}`" }
+    if t == "null" or t == "bool" or t == "string" or t == "int" { null } else if t == "float" {
+        back = try { json.decode(json.encode(v)) } catch (e) { null }
+        if type_of(back) == "float" and back == v { null } else { "the float {v}{here}" }
+    } else if t == "list" {
+        mut found = null
+        for (i, x) in enumerate(v) {
+            found = unstorable(x, "{path}[{i}]")
+            if found != null { break }
+        }
+        found
+    } else if t == "map" {
+        mut found = null
+        for (k, x) in v {
+            found = unstorable(x, "{path}.{k}")
+            if found != null { break }
+        }
+        found
+    } else { "a {t}{here}" }
+}
+
+# Dead-letters every job of `queue_name` whose lease ran out on its last
+# allowed attempt. A worker that dies mid-job never calls `fail`, so without
+# this a job that kills its worker would be reclaimed forever.
+fn bury_exhausted(db, queue_name, now) {
+    sql.exec(
+        db,
+        "update ecko_queue_jobs set status = 'dead', worker_id = null, lease_token = null, " +
+            "lease_expires = null, updated_at = ?, " +
+            "last_error = 'lease expired on attempt ' || attempts || ' of ' || max_attempts || ' without complete or fail' " +
+            "where queue_name = ? and status = 'in_progress' and lease_expires is not null " +
+            "and lease_expires <= ? and attempts >= max_attempts",
+        [now, queue_name, now],
+    )
 }
 
 # SUM(...) over zero matching rows is SQL NULL, not 0.
@@ -72,7 +148,14 @@ fn backoff_delay(base, attempt, cap) {
 fn own_or_die(db, job) {
     row = sql.query_one(db, "select * from ecko_queue_jobs where id = ?", [job.id])
     if row == null {
-        error({ kind: "queue", reason: "not_found", message: "queue: no job with id {job.id}" })
+        error(
+            {
+                kind: "queue",
+                reason: "not_found",
+                id: job.id,
+                message: "queue: no job with id {job.id}",
+            },
+        )
     }
     if row.status != "in_progress" or row.lease_token != job.lease_token {
         error(
@@ -88,10 +171,14 @@ fn own_or_die(db, job) {
 
 # ---- public API -------------------------------------------------------------
 
-## init(db) -> null.
+## Creates the queue's table and claim index if they do not already exist, and
+## returns null. Safe to call every time a program starts; it never touches
+## existing rows.
 ##
-## Creates the queue's table and claim index if they do not already exist.
-## Safe to call every time a program starts; it never touches existing rows.
+## errors: `sql` when the table cannot be created.
+##
+## example:
+##   queue.init(db)
 export fn init(db) {
     sql.exec(
         db,
@@ -119,50 +206,61 @@ export fn init(db) {
     null
 }
 
-## enqueue(db, queue_name, payload, opts?) -> the new job's id.
+## Adds a job to `queue_name` and returns its id.
 ##
-## `payload` is JSON-encoded before it is stored, so it can be any
-## JSON-serializable value. `opts.delay_ms` (default 0) or an absolute
-## `opts.run_at` (unix ms) delays when the job becomes claimable - `run_at`
-## wins if both are given. `opts.max_attempts` (default 5) is how many `fail`
-## calls the job survives before `fail` dead-letters it. `opts.now` overrides
-## the clock (for tests); everything else defaults from it.
+## Pass the `tx` of your own `sql.transaction` to enqueue atomically with your
+## other writes: the job commits with them or not at all. `payload` must be
+## plain data that JSON gives back unchanged (null, bools, ints, floats,
+## strings, and lists and maps of those), so `claim` hands back exactly what
+## was enqueued. `delay_ms` or an absolute `run_at` (unix ms) delays when the
+## job becomes claimable - `run_at` wins if both are given. `max_attempts` is
+## how many times the job may be claimed: a job whose last attempt fails, or
+## whose last lease expires, is dead-lettered. `now` overrides the clock.
+##
+## errors: `queue`/`not_storable` when `payload` holds a decimal, record,
+## secret, bytes or function; `bug`/`bad_argument` for an empty queue name, a
+## negative `delay_ms`, a `max_attempts` that is not a positive Int, or a
+## non-Int `run_at` or `now`; `sql` when the insert fails.
 ##
 ## example:
 ##   queue.enqueue(db, "emails", { to: "a@example.com" })
-##   queue.enqueue(db, "reports", { id: 9 }, { delay_ms: 60000, max_attempts: 3 })
-export fn enqueue(db, queue_name, payload, opts = empty_map()) {
-    now = now_of(opts)
-    explicit_run_at = get(opts, "run_at")
-    run_at = if explicit_run_at != null {
-        explicit_run_at
-    } else {
-        now + default_to(opts, "delay_ms", 0)
+##   queue.enqueue(db, "reports", { id: 9 }, delay_ms: 60000, max_attempts: 3)
+export fn enqueue(db, queue_name, payload, delay_ms = 0, run_at = null, max_attempts = 5, now = null) {
+    no_opts_map("enqueue", delay_ms, "queue.enqueue(db, name, payload, delay_ms: 1000, now: 0)")
+    check_text("enqueue", "queue_name", queue_name)
+    check_int("enqueue", "delay_ms", delay_ms, 0)
+    unless run_at == null or type_of(run_at) == "int" {
+        bad_arg(
+            "queue.enqueue: run_at must be an Int of Unix milliseconds, got {fmt.inspect(run_at)}",
+        )
     }
-    max_attempts = default_to(opts, "max_attempts", 5)
-    sql.transaction(
-        db,
-        fn(tx) {
-            sql.exec(
-                tx,
-                "insert into ecko_queue_jobs " +
-                    "(queue_name, payload, status, run_at, attempts, max_attempts, created_at, updated_at) " +
-                    "values (?, ?, 'ready', ?, 0, ?, ?, ?)",
-                [queue_name, json.encode(payload), run_at, max_attempts, now, now],
-            )
-            sql.query_one(tx, "select id from ecko_queue_jobs where rowid = last_insert_rowid()").id
-        },
-    )
+    check_int("enqueue", "max_attempts", max_attempts, 1)
+    at = clock("enqueue", now)
+    why = unstorable(payload)
+    if why != null {
+        error(
+            {
+                kind: "queue",
+                reason: "not_storable",
+                message: "queue.enqueue: the payload holds {why}, which JSON would not give back unchanged; enqueue plain data (convert decimals to strings, records to maps, and never put a secret in a job)",
+            },
+        )
+    }
+    due = if run_at != null { run_at } else { at + delay_ms }
+    # One statement, so it needs no transaction of its own and can run inside
+    # the caller's.
+    sql.query_one(db, "insert into ecko_queue_jobs " + "(queue_name, payload, status, run_at, attempts, max_attempts, created_at, updated_at) " + "values (?, ?, 'ready', ?, 0, ?, ?, ?) returning id", [queue_name, json.encode(payload), due, max_attempts, at, at]).id
 }
 
-## claim(db, queue_name, worker_id, lease_ms, opts?) -> a job, or null.
+## Atomically claims the oldest ready job for `queue_name` under a fresh lease
+## of `lease_ms`, or returns `null` when nothing is ready.
 ##
-## Atomically picks the oldest ready job for `queue_name` - due now (`run_at`
-## has passed) and either never claimed or claimed but past its
-## `lease_expires` - marks it `"in_progress"` under a fresh lease, and returns
-## `{ id, queue_name, payload, attempts, max_attempts, worker_id, lease_token,
-## lease_expires }`. Returns `null` when nothing is ready. `payload` is the
-## value passed to `enqueue`, JSON-decoded back.
+## A job is ready when its `run_at` has passed and it is either unclaimed or
+## claimed with an expired lease and attempts to spare. It is marked
+## `"in_progress"` and returned as `{ id, queue_name, payload, attempts,
+## max_attempts, worker_id, lease_token, lease_expires }`, where `payload` is
+## the value passed to `enqueue`. A job whose lease expired on its last allowed
+## attempt is dead-lettered here instead of being handed out again.
 ##
 ## `lease_token` changes on every claim, including a reclaim of an expired
 ## lease - it is what makes a stale worker's `complete`/`fail`/`extend` fail
@@ -174,11 +272,19 @@ export fn enqueue(db, queue_name, payload, opts = empty_map()) {
 ## the same database file; brief "database is locked" contention between them
 ## is retried inside `claim` rather than thrown.
 ##
+## errors: `bug`/`bad_argument` for an empty queue name or worker id, a
+## `lease_ms` that is not a positive Int, or a non-Int `now`; `sql` when the
+## database refuses the claim for longer than the retries.
+##
 ## example:
-##   job = queue.claim(db, "emails", "worker-1", 30000)   # 30s lease
-##   if job == null { return }   # nothing ready right now
-export fn claim(db, queue_name, worker_id, lease_ms, opts = empty_map()) {
-    now = now_of(opts)
+##   job = queue.claim(db, "emails", "worker-1", 30000)   # 30s lease, or null
+export fn claim(db, queue_name, worker_id, lease_ms, now = null) {
+    no_opts_map("claim", now, "queue.claim(db, name, worker, lease_ms, now: 0)")
+    check_text("claim", "queue_name", queue_name)
+    check_text("claim", "worker_id", worker_id)
+    check_int("claim", "lease_ms", lease_ms, 1)
+    t = clock("claim", now)
+    with_lock_retry(fn() bury_exhausted(db, queue_name, t))
     token = uuid.v4()
     # One statement, so picking the job and taking its lease cannot be split
     # by another worker: SQLite runs it under a single write lock.
@@ -187,10 +293,11 @@ export fn claim(db, queue_name, worker_id, lease_ms, opts = empty_map()) {
         "where id = (select id from ecko_queue_jobs " +
         "where queue_name = ? and run_at <= ? " +
         "and (status = 'ready' " +
-        "or (status = 'in_progress' and lease_expires is not null and lease_expires <= ?)) " +
+        "or (status = 'in_progress' and lease_expires is not null and lease_expires <= ? " +
+        "and attempts < max_attempts)) " +
         "order by run_at asc, id asc limit 1) " +
         "returning *"
-    params = [worker_id, token, now + lease_ms, now, queue_name, now, now]
+    params = [worker_id, token, t + lease_ms, t, queue_name, t, t]
     row = with_lock_retry(fn() sql.query_one(db, claim_sql, params))
     if row == null { null } else {
         {
@@ -209,13 +316,7 @@ export fn claim(db, queue_name, worker_id, lease_ms, opts = empty_map()) {
 # Another connection holding the write lock makes SQLite refuse at once with
 # "database is locked". That is contention, not failure, so wait briefly and
 # try again; anything else, or a lock that outlasts the retries, is thrown.
-# A short, growing pause: 2 ms times the attempt. `sleep` took seconds before
-# Ecko 0.58 and takes whole milliseconds from 0.58 on, and the type of
-# `time.monotonic()` says which this is, so the wait is the same on both.
-fn backoff(attempt) {
-    if type_of(time.monotonic()) == "int" { 2 * attempt } else { 0.002 * attempt }
-}
-
+# A short, growing pause: 2 ms times the attempt.
 fn with_lock_retry(action) {
     mut attempt = 0
     loop {
@@ -224,43 +325,54 @@ fn with_lock_retry(action) {
             locked = get(e, "kind") == "sql" and msg != null and contains(msg, "database is locked")
             if not locked or attempt >= 50 { error(e) }
             attempt = attempt + 1
-            sleep(backoff(attempt))
+            sleep(2 * attempt)
         }
     }
 }
 
-## complete(db, job, opts?) -> null.
+## Marks `job` (as returned by `claim`) done and returns null.
 ##
-## Marks `job` (as returned by `claim`) done. Throws
-## `{ kind: "queue", reason: "lease_lost" }` if another worker has since
-## reclaimed the job, or `{ reason: "not_found" }` if the row is gone.
-export fn complete(db, job, opts = empty_map()) {
-    now = now_of(opts)
+## errors: `queue`/`lease_lost` if another worker has since reclaimed the job
+## or it already finished; `queue`/`not_found` (with `id`) if the row is gone;
+## `bug`/`bad_argument` when `job` is not a claimed job or `now` is not an Int.
+##
+## example:
+##   queue.complete(db, job)
+export fn complete(db, job, now = null) {
+    no_opts_map("complete", now, "queue.complete(db, job, now: 0)")
+    check_job("complete", job)
+    t = clock("complete", now)
     own_or_die(db, job)
     sql.exec(
         db,
         "update ecko_queue_jobs set status = 'done', worker_id = null, " +
             "lease_token = null, lease_expires = null, updated_at = ? where id = ?",
-        [now, job.id],
+        [t, job.id],
     )
     null
 }
 
-## fail(db, job, reason, opts?) -> `{ status, attempts, run_at }`.
+## Records a failed attempt on `job` and returns `{ status, attempts, run_at }`.
 ##
-## Records a failed attempt on `job`. While `job.attempts` is under
-## `job.max_attempts` the job goes back to `"ready"` after an exponential
-## backoff (`opts.backoff_ms`, default 1000, doubling per attempt, capped at
-## `opts.backoff_max_ms`, default 60000); once attempts reach `max_attempts`
-## it is moved to `"dead"` instead (see `dead`). `reason` is stored as
-## `last_error`. Throws the same lease errors as `complete` if the caller no
-## longer holds the job.
+## While the job has attempts left it goes back to `"ready"` after an
+## exponential backoff (`backoff_ms`, doubling per attempt, capped at
+## `backoff_max_ms`); on its last attempt (`attempts == max_attempts`) it is
+## moved to `"dead"` instead (see `dead` and `retry_dead`). `reason` is stored
+## as `last_error`, as text.
+##
+## errors: the lease errors of `complete`; `bug`/`bad_argument` when `job` is
+## not a claimed job, `backoff_ms` is negative, `backoff_max_ms` is not a
+## positive Int, or `now` is not an Int.
 ##
 ## example:
-##   queue.fail(db, job, "smtp timeout")
-##   # -> { status: "ready", attempts: 1, run_at: 1700000001000 }
-export fn fail(db, job, reason, opts = empty_map()) {
-    now = now_of(opts)
+##   queue.fail(db, job, "smtp timeout")   # {attempts: 1, run_at: 1700000001000, status: ready}
+export fn fail(db, job, reason, backoff_ms = 1000, backoff_max_ms = 60000, now = null) {
+    no_opts_map("fail", backoff_ms, "queue.fail(db, job, reason, backoff_ms: 500, now: 0)")
+    check_job("fail", job)
+    check_int("fail", "backoff_ms", backoff_ms, 0)
+    check_int("fail", "backoff_max_ms", backoff_max_ms, 1)
+    t = clock("fail", now)
+    why_text = if type_of(reason) == "string" { reason } else { string(reason) }
     row = own_or_die(db, job)
     if row.attempts >= row.max_attempts {
         sql.exec(
@@ -268,37 +380,42 @@ export fn fail(db, job, reason, opts = empty_map()) {
             "update ecko_queue_jobs set status = 'dead', worker_id = null, " +
                 "lease_token = null, lease_expires = null, last_error = ?, updated_at = ? " +
                 "where id = ?",
-            [reason, now, job.id],
+            [why_text, t, job.id],
         )
         { status: "dead", attempts: row.attempts, run_at: row.run_at }
     } else {
-        base = default_to(opts, "backoff_ms", 1000)
-        cap = default_to(opts, "backoff_max_ms", 60000)
-        run_at = now + backoff_delay(base, row.attempts, cap)
+        run_at = t + backoff_delay(backoff_ms, row.attempts, backoff_max_ms)
         sql.exec(
             db,
             "update ecko_queue_jobs set status = 'ready', worker_id = null, " +
                 "lease_token = null, lease_expires = null, last_error = ?, run_at = ?, " +
                 "updated_at = ? where id = ?",
-            [reason, run_at, now, job.id],
+            [why_text, run_at, t, job.id],
         )
         { status: "ready", attempts: row.attempts, run_at: run_at }
     }
 }
 
-## extend(db, job, lease_ms, opts?) -> `job` with a refreshed `lease_expires`.
+## Refreshes a claimed job's lease to `lease_ms` from now and returns the job
+## with its new `lease_expires`, for work that legitimately needs longer than
+## its original lease.
 ##
-## For a job that legitimately needs more time than its original lease.
-## Throws the same lease errors as `complete` if another worker has since
-## reclaimed it.
-export fn extend(db, job, lease_ms, opts = empty_map()) {
-    now = now_of(opts)
+## errors: the lease errors of `complete`; `bug`/`bad_argument` when `job` is
+## not a claimed job, `lease_ms` is not a positive Int, or `now` is not an Int.
+##
+## example:
+##   job2 = queue.extend(db, job, 60000)
+export fn extend(db, job, lease_ms, now = null) {
+    no_opts_map("extend", now, "queue.extend(db, job, lease_ms, now: 0)")
+    check_job("extend", job)
+    check_int("extend", "lease_ms", lease_ms, 1)
+    t = clock("extend", now)
     own_or_die(db, job)
-    lease_expires = now + lease_ms
+    lease_expires = t + lease_ms
     sql.exec(
         db,
         "update ecko_queue_jobs set lease_expires = ?, updated_at = ? where id = ?",
-        [lease_expires, now, job.id],
+        [lease_expires, t, job.id],
     )
     {
         id: job.id,
@@ -312,15 +429,24 @@ export fn extend(db, job, lease_ms, opts = empty_map()) {
     }
 }
 
-## stats(db, queue_name, opts?) -> counts for `queue_name`.
+## Counts the jobs of `queue_name` by state: `{ ready, scheduled, in_progress,
+## expired, done, dead, total }`.
 ##
-## `{ ready, scheduled, in_progress, expired, done, dead, total }`. `ready` is
-## due and unclaimed right now; `scheduled` is `"ready"` status with `run_at`
-## still in the future; `in_progress` is actively leased; `expired` is leased
-## but past `lease_expires` (claimable on the next `claim`); `done` and `dead`
-## are terminal.
-export fn stats(db, queue_name, opts = empty_map()) {
-    now = now_of(opts)
+## `ready` is due and unclaimed right now; `scheduled` is `"ready"` status with
+## `run_at` still in the future; `in_progress` is actively leased; `expired` is
+## leased but past `lease_expires` with attempts to spare (claimable on the
+## next `claim`); `done` and `dead` are terminal, and `dead` includes a job
+## whose lease expired on its last attempt.
+##
+## errors: `bug`/`bad_argument` when `now` is not an Int; `sql` when the table
+## cannot be read.
+##
+## example:
+##   queue.stats(db, "emails").ready   # 3
+export fn stats(db, queue_name, now = null) {
+    no_opts_map("stats", now, "queue.stats(db, name, now: 0)")
+    t = clock("stats", now)
+    with_lock_retry(fn() bury_exhausted(db, queue_name, t))
     row = sql.query_one(
         db,
         "select " +
@@ -334,7 +460,7 @@ export fn stats(db, queue_name, opts = empty_map()) {
             "sum(case when status = 'dead' then 1 else 0 end) as dead, " +
             "count(*) as total " +
             "from ecko_queue_jobs where queue_name = ?",
-        [now, now, now, now, queue_name],
+        [t, t, t, t, queue_name],
     )
     {
         ready: zero_if_null(row.ready),
@@ -347,13 +473,18 @@ export fn stats(db, queue_name, opts = empty_map()) {
     }
 }
 
-## dead(db, queue_name, opts?) -> dead-lettered jobs for `queue_name`.
+## The dead-lettered jobs of `queue_name`, newest first, at most `limit` of
+## them: `[{ id, payload, attempts, max_attempts, last_error, created_at,
+## updated_at }, ...]`.
 ##
-## Newest first: `[{ id, payload, attempts, max_attempts, last_error,
-## created_at, updated_at }, ...]`. `opts.limit` caps how many are returned
-## (default 100).
-export fn dead(db, queue_name, opts = empty_map()) {
-    limit = default_to(opts, "limit", 100)
+## errors: `bug`/`bad_argument` when `limit` is not a positive Int; `sql` when
+## the table cannot be read.
+##
+## example:
+##   map(queue.dead(db, "emails"), fn(j) j.last_error)   # ["smtp timeout"]
+export fn dead(db, queue_name, limit = 100) {
+    no_opts_map("dead", limit, "queue.dead(db, name, limit: 10)")
+    check_int("dead", "limit", limit, 1)
     rows = sql.query(
         db,
         "select * from ecko_queue_jobs where queue_name = ? and status = 'dead' " +
@@ -371,4 +502,34 @@ export fn dead(db, queue_name, opts = empty_map()) {
             updated_at: row.updated_at,
         }
     })
+}
+
+## Moves the dead job `id` back to `"ready"` with its attempts reset and its
+## last error cleared, claimable from `now`. Returns null.
+##
+## errors: `queue`/`not_found` (with `id`) when `id` names no dead job;
+## `bug`/`bad_argument` when `now` is not an Int.
+##
+## example:
+##   for j in queue.dead(db, "emails") { queue.retry_dead(db, j.id) }
+export fn retry_dead(db, id, now = null) {
+    no_opts_map("retry_dead", now, "queue.retry_dead(db, id, now: 0)")
+    at = clock("retry_dead", now)
+    changed = sql.exec(
+        db,
+        "update ecko_queue_jobs set status = 'ready', attempts = 0, run_at = ?, last_error = null, " +
+            "updated_at = ? where id = ? and status = 'dead'",
+        [at, at, id],
+    )
+    if changed == 0 {
+        error(
+            {
+                kind: "queue",
+                reason: "not_found",
+                id: id,
+                message: "queue.retry_dead: no dead job with id {id}",
+            },
+        )
+    }
+    null
 }

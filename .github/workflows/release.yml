@@ -2,7 +2,7 @@ name: Release
 
 # Publish a package version by pushing a tag that matches ecko.json:
 #
-#   git tag v0.1.0 && git push origin v0.1.0
+#   git tag v0.9.4 && git push origin v0.9.4
 #
 # The tag is the source of truth for the version, and the first job of this
 # workflow is to refuse a tag that disagrees with the manifest.
